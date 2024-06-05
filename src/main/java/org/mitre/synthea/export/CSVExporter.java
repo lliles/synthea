@@ -333,7 +333,7 @@ public class CSVExporter {
     supplies.write("DATE,PATIENT,ENCOUNTER,CODE,DESCRIPTION,QUANTITY");
     supplies.write(NEWLINE);
 
-    organizations.write("Id,NAME,ADDRESS,CITY,STATE,ZIP,LAT,LON,PHONE,REVENUE,UTILIZATION");
+    organizations.write("Id,NPI,NAME,ADDRESS,CITY,STATE,ZIP,LAT,LON,PHONE,REVENUE,UTILIZATION");
     organizations.write(NEWLINE);
     providers.write("Id,ORGANIZATION,NAME,GENDER,SPECIALITY,ADDRESS,CITY,STATE,ZIP,LAT,LON,"
         + "ENCOUNTERS,PROCEDURES");
@@ -1210,6 +1210,7 @@ public class CSVExporter {
     // Id,NAME,ADDRESS,CITY,STATE,ZIP,PHONE,REVENUE,UTILIZATION
     StringBuilder s = new StringBuilder();
     s.append(org.getResourceID()).append(',');
+    s.append(org.npi).append(',');
     s.append(clean(org.name)).append(',');
     s.append(clean(org.address)).append(',');
     s.append(org.city).append(',');
