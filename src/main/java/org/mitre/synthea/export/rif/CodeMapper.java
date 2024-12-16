@@ -5,6 +5,7 @@ import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
 import java.io.IOException;
 import java.lang.reflect.Type;
+import java.util.AbstractMap.SimpleEntry;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -24,7 +25,7 @@ import org.mitre.synthea.world.concepts.HealthRecord.Code;
 /**
  * Utility class for dealing with code mapping configuration writers.
  */
-class CodeMapper {
+public class CodeMapper {
 
   private final boolean requireCodeMaps; // initialize in ctor to simplify unit testing
   private static final String WEIGHT_KEY = "weight";
@@ -83,6 +84,26 @@ class CodeMapper {
         // For testing, the mapping writer is not present.
         System.out.println("BB2Exporter is running without " + jsonMapResource);
       }
+    }
+  }
+
+  /**
+   * Merge the mappings from the supplied code mapper. This method performs a deep
+   * merge such that destination codes will be merged if this and other contain
+   * mappings for the same source code. Care is required with the use of weights
+   * such that this and other use the same weighting scale (e.g. 0-1) otherwise one
+   * set of mappings could overwhelm the other.
+   * @param other the other code mapper from which mappings will be copied.
+   */
+  public void merge(CodeMapper other) {
+    if (other.hasMap()) {
+      other.map.forEach((source, mapped) -> {
+        if (map.containsKey(source)) {
+          map.get(source).addAll(mapped);
+        } else {
+          map.put(source, mapped);
+        }
+      });
     }
   }
 
@@ -173,7 +194,7 @@ class CodeMapper {
    * {@code map(codeToMap, "code", rand)}.
    * @param codeToMap the Synthea code to look for
    * @param rand a source of random numbers used to pick one of the list of BFD codes
-   * @param stripDots whether to remove dots in codes (e.g. J39.45 -> J3945)
+   * @param stripDots whether to remove dots in codes (e.g. J39.45 becomes J3945)
    * @return the BFD code or null if the code can't be mapped
    */
   public String map(String codeToMap, RandomNumberGenerator rand, boolean stripDots) {
@@ -185,7 +206,7 @@ class CodeMapper {
    * {@code map(codeToMap, "code", rand)}.
    * @param codeToMap the Synthea code to look for
    * @param rand a source of random numbers used to pick one of the list of BFD codes
-   * @param stripDots whether to remove dots in codes (e.g. J39.45 -> J3945)
+   * @param stripDots whether to remove dots in codes (e.g. J39.45 becomes J3945)
    * @return the BFD code or null if the code can't be mapped
    */
   public String map(Code codeToMap, RandomNumberGenerator rand, boolean stripDots) {
@@ -219,7 +240,7 @@ class CodeMapper {
    * @param codeToMap the Synthea code to look for
    * @param bfdCodeType the type of BFD code to map to
    * @param rand a source of random numbers used to pick one of the list of BFD codes
-   * @param stripDots whether to remove dots in codes (e.g. J39.45 -> J3945)
+   * @param stripDots whether to remove dots in codes (e.g. J39.45 becomes J3945)
    * @return the BFD code or null if the code can't be mapped
    */
   public String map(String codeToMap, String bfdCodeType, RandomNumberGenerator rand,
@@ -241,12 +262,30 @@ class CodeMapper {
    * @param codeToMap the Synthea code to look for
    * @param bfdCodeType the type of BFD code to map to
    * @param rand a source of random numbers used to pick one of the list of BFD codes
-   * @param stripDots whether to remove dots in codes (e.g. J39.45 -> J3945)
+   * @param stripDots whether to remove dots in codes (e.g. J39.45 becomes J3945)
    * @return the BFD code or null if the code can't be mapped
    */
   public String map(Code codeToMap, String bfdCodeType, RandomNumberGenerator rand,
           boolean stripDots) {
     return map(codeToMap.code, bfdCodeType, rand, stripDots);
+  }
+
+  /**
+   * Get one of the BFD codes for the supplied Synthea code. Equivalent to
+   * {@code map(codeToMap, "code", rand)}.
+   * @param codeToMap the Synthea code to look for
+   * @param rand a source of random numbers used to pick one of the list of BFD codes
+   * @return the BFD code and display string or null if the code can't be mapped
+   */
+  public SimpleEntry<String, String> mapToCodeAndDescription(Code codeToMap,
+          RandomNumberGenerator rand) {
+    if (!canMap(codeToMap)) {
+      return null;
+    }
+    RandomCollection<Map<String, String>> options = map.get(codeToMap.code);
+    Map<String, String> mappedCode = options.next(rand);
+    return new SimpleEntry<>(mappedCode.get("code"),
+            mappedCode.get("description"));
   }
 
   /**
@@ -263,7 +302,7 @@ class CodeMapper {
       row.put("count", count.toString());
       missingCodeList.add(row);
     });
-    // sort in decending order by count
+    // sort in descending order by count
     Collections.sort(missingCodeList, (o1, o2) -> {
       return (int)(Long.parseLong(o2.get("count")) - Long.parseLong(o1.get("count")));
     });

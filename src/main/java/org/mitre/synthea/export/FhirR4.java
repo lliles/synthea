@@ -10,6 +10,7 @@ import com.google.gson.JsonObject;
 
 import java.awt.geom.Point2D;
 import java.io.IOException;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
@@ -139,7 +140,10 @@ import org.hl7.fhir.utilities.xhtml.XhtmlNode;
 
 import org.mitre.synthea.engine.Components;
 import org.mitre.synthea.engine.Components.Attachment;
+import org.mitre.synthea.export.rif.CodeMapper;
 import org.mitre.synthea.helpers.Config;
+import org.mitre.synthea.helpers.RandomNumberGenerator;
+import org.mitre.synthea.helpers.RandomValueGenerator;
 import org.mitre.synthea.helpers.SimpleCSV;
 import org.mitre.synthea.helpers.Utilities;
 import org.mitre.synthea.identity.Entity;
@@ -172,7 +176,6 @@ public class FhirR4 {
   private static final String RXNORM_URI = "http://www.nlm.nih.gov/research/umls/rxnorm";
   private static final String CVX_URI = "http://hl7.org/fhir/sid/cvx";
   private static final String DISCHARGE_URI = "http://www.nubc.org/patient-discharge";
-  private static final String SHR_EXT = "http://standardhealthrecord.org/fhir/StructureDefinition/";
   private static final String SYNTHEA_EXT = "http://synthetichealth.github.io/synthea/";
   private static final String UNITSOFMEASURE_URI = "http://unitsofmeasure.org";
   private static final String DICOM_DCM_URI = "http://dicom.nema.org/resources/ontology/DCM";
@@ -184,8 +187,6 @@ public class FhirR4 {
   @SuppressWarnings("rawtypes")
   private static final Map languageLookup = loadLanguageLookup();
 
-  protected static boolean USE_SHR_EXTENSIONS =
-      Config.getAsBoolean("exporter.fhir.use_shr_extensions");
   protected static boolean TRANSACTION_BUNDLE =
       Config.getAsBoolean("exporter.fhir.transaction_bundle");
 
@@ -237,9 +238,7 @@ public class FhirR4 {
   }
 
   private static final String COUNTRY_CODE = Config.get("generate.geography.country_code");
-
-  private static final Table<String, String, String> SHR_MAPPING =
-      loadMapping("shr_mapping.csv");
+  private static final String PASSPORT_URI = Config.get("generate.geography.passport_uri", "http://hl7.org/fhir/sid/passport-USA");
 
   private static final HashSet<Class<? extends Resource>> includedResources = new HashSet<>();
   private static final HashSet<Class<? extends Resource>> excludedResources = new HashSet<>();
@@ -345,28 +344,6 @@ public class FhirR4 {
   }
 
 
-  private static Table<String, String, String> loadMapping(String filename) {
-    Table<String, String, String> mappingTable = HashBasedTable.create();
-
-    List<LinkedHashMap<String, String>> csvData;
-    try {
-      csvData = SimpleCSV.parse(Utilities.readResource(filename));
-    } catch (IOException e) {
-      e.printStackTrace();
-      return null;
-    }
-
-    for (LinkedHashMap<String, String> line : csvData) {
-      String system = line.get("SYSTEM");
-      String code = line.get("CODE");
-      String url = line.get("URL");
-
-      mappingTable.put(system, code, url);
-    }
-
-    return mappingTable;
-  }
-
   private static Map<String, Table<String, String, String>>
       loadMappingWithVersions(String filename, String... supportedVersions) {
     Map<String, Table<String,String,String>> versions = new HashMap<>();
@@ -431,7 +408,7 @@ public class FhirR4 {
 
       if (shouldExport(Condition.class)) {
         for (HealthRecord.Entry condition : encounter.conditions) {
-          condition(personEntry, bundle, encounterEntry, condition);
+          condition(person, personEntry, bundle, encounterEntry, condition);
         }
       }
 
@@ -458,7 +435,7 @@ public class FhirR4 {
 
       if (shouldExport(org.hl7.fhir.r4.model.Procedure.class)) {
         for (Procedure procedure : encounter.procedures) {
-          procedure(personEntry, bundle, encounterEntry, procedure);
+          procedure(person, personEntry, bundle, encounterEntry, procedure);
         }
       }
 
@@ -601,7 +578,7 @@ public class FhirR4 {
       Code passportCode = new Code("http://terminology.hl7.org/CodeSystem/v2-0203", "PPN", "Passport Number");
       patientResource.addIdentifier()
           .setType(mapCodeToCodeableConcept(passportCode, "http://terminology.hl7.org/CodeSystem/v2-0203"))
-          .setSystem(SHR_EXT + "passportNumber")
+          .setSystem(PASSPORT_URI)
           .setValue((String) person.attributes.get(Person.IDENTIFIER_PASSPORT));
     }
 
@@ -857,29 +834,6 @@ public class FhirR4 {
     patientResource.setText(new Narrative().setStatus(NarrativeStatus.GENERATED)
         .setDiv(new XhtmlNode(NodeType.Element).setValue(generatedBySynthea)));
 
-    if (USE_SHR_EXTENSIONS) {
-
-      patientResource.setMeta(new Meta().addProfile(SHR_EXT + "shr-entity-Patient"));
-
-      // Patient profile requires race, ethnicity, birthsex,
-      // MothersMaidenName, FathersName, Person-extension
-
-      patientResource.addExtension()
-          .setUrl(SHR_EXT + "shr-actor-FictionalPerson-extension")
-          .setValue(new BooleanType(true));
-
-      String fathersName = (String) person.attributes.get(Person.NAME_FATHER);
-      Extension fathersNameExtension = new Extension(
-          SHR_EXT + "shr-entity-FathersName-extension", new HumanName().setText(fathersName));
-      patientResource.addExtension(fathersNameExtension);
-
-      String ssn = (String) person.attributes.get(Person.IDENTIFIER_SSN);
-      Extension ssnExtension = new Extension(
-          SHR_EXT + "shr-demographics-SocialSecurityNumber-extension",
-          new StringType(ssn));
-      patientResource.addExtension(ssnExtension);
-    }
-
     // DALY and QALY values
     // we only write the last(current) one to the patient record
     Double dalyValue = (Double) person.attributes.get("most-recent-daly");
@@ -900,6 +854,27 @@ public class FhirR4 {
   }
 
   /**
+   * Add a code translation (if available) of the supplied source code to the
+   * supplied CodeableConcept.
+   * @param codeSystem the code system of the translated code
+   * @param from the source code
+   * @param to the CodeableConcept to add the translation to
+   * @param rand a source of randomness
+   */
+  private static void addTranslation(String codeSystem, Code from,
+          CodeableConcept to, RandomNumberGenerator rand) {
+    CodeMapper mapper = Exporter.getCodeMapper(codeSystem);
+    if (mapper != null && mapper.canMap(from)) {
+      Coding coding = new Coding();
+      Map.Entry<String, String> mappedCode = mapper.mapToCodeAndDescription(from, rand);
+      coding.setCode(mappedCode.getKey());
+      coding.setDisplay(mappedCode.getValue());
+      coding.setSystem(ExportHelper.getSystemURI("ICD10-CM"));
+      to.addCoding(coding);
+    }
+  }
+
+  /**
    * Map the given Encounter into a FHIR Encounter resource, and add it to the given Bundle.
    *
    * @param personEntry Entry for the Person
@@ -915,15 +890,6 @@ public class FhirR4 {
       meta.addProfile(
           "http://hl7.org/fhir/us/core/StructureDefinition/us-core-encounter");
       encounterResource.setMeta(meta);
-    } else if (USE_SHR_EXTENSIONS) {
-      encounterResource.setMeta(
-          new Meta().addProfile(SHR_EXT + "shr-encounter-EncounterPerformed"));
-      Extension performedContext = new Extension();
-      performedContext.setUrl(SHR_EXT + "shr-action-PerformedContext-extension");
-      performedContext.addExtension(
-          SHR_EXT + "shr-action-Status-extension",
-          new CodeType("finished"));
-      encounterResource.addExtension(performedContext);
     }
 
     Patient patient = (Patient) personEntry.getResource();
@@ -953,6 +919,8 @@ public class FhirR4 {
     if (encounter.reason != null) {
       encounterResource.addReasonCode().addCoding().setCode(encounter.reason.code)
           .setDisplay(encounter.reason.display).setSystem(SNOMED_URI);
+      addTranslation("ICD10-CM", encounter.reason,
+              encounterResource.getReasonCodeFirstRep(), person);
     }
 
     Provider provider = encounter.provider;
@@ -1666,6 +1634,7 @@ public class FhirR4 {
    * @return The added Entry
    */
   private static BundleEntryComponent condition(
+          RandomNumberGenerator rand,
           BundleEntryComponent personEntry, Bundle bundle, BundleEntryComponent encounterEntry,
           HealthRecord.Entry condition) {
     Condition conditionResource = new Condition();
@@ -1683,18 +1652,15 @@ public class FhirR4 {
       conditionResource.addCategory(new CodeableConcept().addCoding(new Coding(
           "http://terminology.hl7.org/CodeSystem/condition-category", "encounter-diagnosis",
           "Encounter Diagnosis")));
-    } else if (USE_SHR_EXTENSIONS) {
-      conditionResource.setMeta(new Meta().addProfile(SHR_EXT + "shr-condition-Condition"));
-      conditionResource.addCategory(new CodeableConcept().addCoding(new Coding(
-          "http://standardhealthrecord.org/shr/condition/vs/ConditionCategoryVS", "disease",
-          "Disease")));
     }
 
     conditionResource.setSubject(new Reference(personEntry.getFullUrl()));
     conditionResource.setEncounter(new Reference(encounterEntry.getFullUrl()));
 
     Code code = condition.codes.get(0);
-    conditionResource.setCode(mapCodeToCodeableConcept(code, SNOMED_URI));
+    CodeableConcept concept = mapCodeToCodeableConcept(code, SNOMED_URI);
+    addTranslation("ICD10-CM", code, concept, rand);
+    conditionResource.setCode(concept);
 
     CodeableConcept verification = new CodeableConcept();
     verification.getCodingFirstRep()
@@ -1955,19 +1921,6 @@ public class FhirR4 {
         observationResource.setMeta(meta);
       }
     }
-    if (USE_SHR_EXTENSIONS) {
-      Meta meta = new Meta();
-      meta.addProfile(SHR_EXT + "shr-finding-Observation"); // all Observations are Observations
-      if ("vital-signs".equals(observation.category)) {
-        meta.addProfile(SHR_EXT + "shr-vital-VitalSign");
-      }
-      // add the specific profile based on code
-      String codeMappingUri = SHR_MAPPING.get(LOINC_URI, code.code);
-      if (codeMappingUri != null) {
-        meta.addProfile(codeMappingUri);
-      }
-      observationResource.setMeta(meta);
-    }
 
     BundleEntryComponent entry = newEntry(bundle, observationResource, observation.uuid.toString());
     observation.fullUrl = entry.getFullUrl();
@@ -2041,13 +1994,14 @@ public class FhirR4 {
   /**
    * Map the given Procedure into a FHIR Procedure resource, and add it to the given Bundle.
    *
+   * @param person         The Person
    * @param personEntry    The Person entry
    * @param bundle         Bundle to add to
    * @param encounterEntry The current Encounter entry
    * @param procedure      The Procedure
    * @return The added Entry
    */
-  private static BundleEntryComponent procedure(
+  private static BundleEntryComponent procedure(Person person,
           BundleEntryComponent personEntry, Bundle bundle, BundleEntryComponent encounterEntry,
           Procedure procedure) {
     org.hl7.fhir.r4.model.Procedure procedureResource = new org.hl7.fhir.r4.model.Procedure();
@@ -2090,22 +2044,8 @@ public class FhirR4 {
         // we didn't find a matching Condition,
         // fallback to just reason code
         procedureResource.addReasonCode(mapCodeToCodeableConcept(reason, SNOMED_URI));
+        addTranslation("ICD10-CM", reason, procedureResource.getReasonCodeFirstRep(), person);
       }
-    }
-
-    if (USE_SHR_EXTENSIONS) {
-      procedureResource.setMeta(
-          new Meta().addProfile(SHR_EXT + "shr-procedure-ProcedurePerformed"));
-      // required fields for this profile are action-PerformedContext-extension,
-      // status, code, subject, performed[x]
-
-      Extension performedContext = new Extension();
-      performedContext.setUrl(SHR_EXT + "shr-action-PerformedContext-extension");
-      performedContext.addExtension(
-          SHR_EXT + "shr-action-Status-extension",
-          new CodeType("completed"));
-
-      procedureResource.addExtension(performedContext);
     }
 
     BundleEntryComponent procedureEntry =
@@ -2296,15 +2236,8 @@ public class FhirR4 {
       meta.addProfile(
           "http://hl7.org/fhir/us/core/StructureDefinition/us-core-immunization");
       immResource.setMeta(meta);
-    } else if (USE_SHR_EXTENSIONS) {
-      immResource.setMeta(new Meta().addProfile(SHR_EXT + "shr-immunization-ImmunizationGiven"));
-      Extension performedContext = new Extension();
-      performedContext.setUrl(SHR_EXT + "shr-action-PerformedContext-extension");
-      performedContext.addExtension(
-          SHR_EXT + "shr-action-Status-extension",
-          new CodeType("completed"));
-      immResource.addExtension(performedContext);
     }
+
     immResource.setStatus(ImmunizationStatus.COMPLETED);
     immResource.setOccurrence(convertFhirDateTime(immunization.start, true));
     immResource.setVaccineCode(mapCodeToCodeableConcept(immunization.codes.get(0), CVX_URI));
@@ -2348,24 +2281,8 @@ public class FhirR4 {
       Code category = new Code("http://terminology.hl7.org/CodeSystem/medicationrequest-category",
           "community", "Community");
       medicationResource.addCategory(mapCodeToCodeableConcept(category, null));
-    } else if (USE_SHR_EXTENSIONS) {
-      medicationResource.addExtension()
-        .setUrl(SHR_EXT + "shr-base-ActionCode-extension")
-        .setValue(PRESCRIPTION_OF_DRUG_CC);
-
-      medicationResource.setMeta(new Meta()
-          .addProfile(SHR_EXT + "shr-medication-MedicationRequested"));
-
-      Extension requestedContext = new Extension();
-      requestedContext.setUrl(SHR_EXT + "shr-action-RequestedContext-extension");
-      requestedContext.addExtension(
-          SHR_EXT + "shr-action-Status-extension",
-          new CodeType("completed"));
-      requestedContext.addExtension(
-          SHR_EXT + "shr-action-RequestIntent-extension",
-          new CodeType("original-order"));
-      medicationResource.addExtension(requestedContext);
     }
+
     medicationResource.setSubject(new Reference(personEntry.getFullUrl()));
     medicationResource.setEncounter(new Reference(encounterEntry.getFullUrl()));
 
@@ -2437,6 +2354,8 @@ public class FhirR4 {
         // we didn't find a matching Condition,
         // fallback to just reason code
         medicationResource.addReasonCode(mapCodeToCodeableConcept(reason, SNOMED_URI));
+        addTranslation("ICD10-CM", reason, medicationResource.getReasonCodeFirstRep(),
+                person);
       }
     }
 
@@ -2489,8 +2408,10 @@ public class FhirR4 {
             text.append(instructionCode.display).append('\n');
             dosage.addAdditionalInstruction(mapCodeToCodeableConcept(instructionCode, SNOMED_URI));
           }
-          text.deleteCharAt(text.length() - 1); // delete the last newline char
-          dosage.setText(text.toString());
+          if (text.length() > 0) {
+            text.deleteCharAt(text.length() - 1); // delete the last newline char
+            dosage.setText(text.toString());
+          }
         }
       }
 
@@ -2587,6 +2508,8 @@ public class FhirR4 {
         // we didn't find a matching Condition,
         // fallback to just reason code
         medicationResource.addReasonCode(mapCodeToCodeableConcept(reason, SNOMED_URI));
+        addTranslation("ICD10-CM", reason, medicationResource.getReasonCodeFirstRep(),
+                person);
       }
     }
 
@@ -2596,11 +2519,6 @@ public class FhirR4 {
         newEntry(bundle, medicationResource, medicationAdminUUID);
     return medicationAdminEntry;
   }
-
-  private static final Code PRESCRIPTION_OF_DRUG_CODE =
-      new Code("SNOMED-CT", "33633005", "Prescription of drug (procedure)");
-  private static final CodeableConcept PRESCRIPTION_OF_DRUG_CC =
-      mapCodeToCodeableConcept(PRESCRIPTION_OF_DRUG_CODE, SNOMED_URI);
 
   /**
    * Map the given Report to a FHIR DiagnosticReport resource, and add it to the given Bundle.
@@ -2835,6 +2753,8 @@ public class FhirR4 {
           activityDetailComponent.addReasonReference().setReference(reasonCondition.getFullUrl());
         } else if (reason != null) {
           activityDetailComponent.addReasonCode(mapCodeToCodeableConcept(reason, SNOMED_URI));
+          addTranslation("ICD10-CM", reason, activityDetailComponent.getReasonCodeFirstRep(),
+                  person);
         }
 
         activityComponent.setDetail(activityDetailComponent);
@@ -2981,7 +2901,9 @@ public class FhirR4 {
 
     if (carePlan.reasons != null && !carePlan.reasons.isEmpty()) {
       for (Code code : carePlan.reasons) {
-        careTeam.addReasonCode(mapCodeToCodeableConcept(code, SNOMED_URI));
+        CodeableConcept concept = mapCodeToCodeableConcept(code, SNOMED_URI);
+        addTranslation("ICD10-CM", code, concept, person);
+        careTeam.addReasonCode(concept);
       }
     }
 
@@ -3195,13 +3117,8 @@ public class FhirR4 {
       meta.addProfile(
           "http://hl7.org/fhir/us/core/StructureDefinition/us-core-organization");
       organizationResource.setMeta(meta);
-    } else if (USE_SHR_EXTENSIONS) {
-      organizationResource.setMeta(new Meta().addProfile(SHR_EXT + "shr-entity-Organization"));
-      organizationResource.addIdentifier()
-          .setSystem("urn:ietf:rfc:3986")
-          .setValue("urn:uuid" + provider.getResourceID());
-      organizationResource.addContact().setName(new HumanName().setText("Synthetic Provider"));
     }
+
     List<CodeableConcept> organizationType = new ArrayList<CodeableConcept>();
     organizationType.add(
         mapCodeToCodeableConcept(

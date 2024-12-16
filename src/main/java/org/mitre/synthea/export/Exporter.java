@@ -14,14 +14,17 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.ServiceLoader;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.commons.lang3.tuple.Pair;
@@ -34,6 +37,7 @@ import org.mitre.synthea.export.flexporter.FhirPathUtils;
 import org.mitre.synthea.export.flexporter.FlexporterJavascriptContext;
 import org.mitre.synthea.export.flexporter.Mapping;
 import org.mitre.synthea.export.rif.BB2RIFExporter;
+import org.mitre.synthea.export.rif.CodeMapper;
 import org.mitre.synthea.helpers.Config;
 import org.mitre.synthea.helpers.TransitionMetrics;
 import org.mitre.synthea.helpers.Utilities;
@@ -69,6 +73,7 @@ public abstract class Exporter {
 
   private static List<PatientExporter> patientExporters;
   private static List<PostCompletionExporter> postCompletionExporters;
+  private static Map<String, CodeMapper> codeMappers;
 
   /**
    * If the config setting "exporter.enable_custom_exporters" is enabled,
@@ -96,6 +101,45 @@ public abstract class Exporter {
   }
 
   /**
+   * Load any configured code mappers. Code mappers are configured via the
+   * synthea.properties file and a sample configuration is shown below:
+   * <pre>
+   * exporter.code_map.icd_10=export/anti_amyloid_code_map.json
+   * exporter.code_map.cpt=export/phlebotomy_code_map.json,export/neurology_code_map.json
+   * </pre>
+   * The above define a single code map for ICD-10 codes and two code maps for CPT codes.
+   */
+  public static void loadCodeMappers() {
+    codeMappers = new HashMap<String, CodeMapper>();
+    List<String> codeSystemProperties = Config.allPropertyNames()
+            .stream()
+            .filter((key) -> key.startsWith("exporter.code_map"))
+            .collect(Collectors.toList());
+    codeSystemProperties.forEach(codeSystemProperty -> {
+      String codeSystem = codeSystemProperty.strip().replace(
+              "exporter.code_map.", "").toUpperCase();
+      String[] resources = Config.get(codeSystemProperty).split(",");
+      for (String resource: resources) {
+        CodeMapper mapper = new CodeMapper(resource);
+        if (codeMappers.containsKey(codeSystem)) {
+          codeMappers.get(codeSystem).merge(mapper);
+        } else {
+          codeMappers.put(codeSystem, mapper);
+        }
+      }
+    });
+  }
+
+  /**
+   * Get the code mapper for the supplied code system.
+   * @param codeSystem the code system
+   * @return the corresponding code mapper or null if none configured
+   */
+  public static CodeMapper getCodeMapper(String codeSystem) {
+    return codeMappers.get(codeSystem);
+  }
+
+  /**
    * Runtime configuration of the record exporter.
    */
   public static class ExporterRuntimeOptions {
@@ -109,7 +153,7 @@ public abstract class Exporter {
     private List<Mapping> flexporterMappings;
 
     public ExporterRuntimeOptions() {
-      yearsOfHistory = Integer.parseInt(Config.get("exporter.years_of_history"));
+      yearsOfHistory = Config.getAsInteger("exporter.years_of_history", 10);
     }
 
     /**
@@ -390,7 +434,8 @@ public abstract class Exporter {
       writeNewFile(outFilePath, consolidatedNotes);
     }
 
-    if (patientExporters != null && !patientExporters.isEmpty()) {
+    if (Config.getAsBoolean("exporter.custom.export", true)
+            && patientExporters != null && !patientExporters.isEmpty()) {
       for (PatientExporter patientExporter : patientExporters) {
         patientExporter.export(person, stopTime, options);
       }
@@ -503,34 +548,6 @@ public abstract class Exporter {
    */
   public static void runPostCompletionExports(Generator generator, ExporterRuntimeOptions options) {
 
-    if (Config.getAsBoolean("exporter.fhir.bulk_data")) {
-      IParser parser = FhirR4.getContext().newJsonParser();
-      parser.setPrettyPrint(false);
-      Parameters parameters = new Parameters()
-              .addParameter("inputFormat","application/fhir+ndjson");
-      File outDirectory = getOutputFolder("fhir", null);
-
-      File[] files = outDirectory.listFiles(pathname -> pathname.getName().endsWith("ndjson"));
-
-      String configHostname = Config.get("exporter.fhir.bulk_data.parameter_hostname");
-      String hostname = Strings.isNullOrEmpty(configHostname)
-              ? "http://localhost:8080/" : configHostname;
-
-      for (File file : files) {
-        parameters.addParameter(
-                new Parameters.ParametersParameterComponent().setName("input")
-                        .addPart(new Parameters.ParametersParameterComponent()
-                                .setName("type")
-                                .setValue(new StringType(file.getName().split("\\.")[0])))
-                        .addPart(new Parameters.ParametersParameterComponent()
-                                .setName("url")
-                                .setValue(new StringType(hostname + file.getName()))));
-      }
-      overwriteFile(outDirectory.toPath().resolve("parameters.json"),
-          parser.encodeResourceToString(parameters));
-    }
-
-
     if (options.deferExports) {
       ExporterRuntimeOptions nonDeferredOptions = new ExporterRuntimeOptions(options);
       nonDeferredOptions.deferExports = false;
@@ -619,7 +636,35 @@ public abstract class Exporter {
       TransitionMetrics.exportMetrics();
     }
 
-    if (postCompletionExporters != null && !postCompletionExporters.isEmpty()) {
+    if (Config.getAsBoolean("exporter.fhir.bulk_data")) {
+      IParser parser = FhirR4.getContext().newJsonParser();
+      parser.setPrettyPrint(false);
+      Parameters parameters = new Parameters()
+              .addParameter("inputFormat","application/fhir+ndjson");
+      File outDirectory = getOutputFolder("fhir", null);
+
+      File[] files = outDirectory.listFiles(pathname -> pathname.getName().endsWith("ndjson"));
+
+      String configHostname = Config.get("exporter.fhir.bulk_data.parameter_hostname");
+      String hostname = Strings.isNullOrEmpty(configHostname)
+              ? "http://localhost:8000/" : configHostname;
+
+      for (File file : files) {
+        parameters.addParameter(
+                new Parameters.ParametersParameterComponent().setName("input")
+                        .addPart(new Parameters.ParametersParameterComponent()
+                                .setName("type")
+                                .setValue(new StringType(file.getName().split("\\.")[0])))
+                        .addPart(new Parameters.ParametersParameterComponent()
+                                .setName("url")
+                                .setValue(new StringType(hostname + file.getName()))));
+      }
+      overwriteFile(outDirectory.toPath().resolve("parameters.json"),
+              parser.encodeResourceToString(parameters));
+    }
+
+    if (Config.getAsBoolean("exporter.custom.export", true)
+            && postCompletionExporters != null && !postCompletionExporters.isEmpty()) {
       for (PostCompletionExporter postCompletionExporter : postCompletionExporters) {
         postCompletionExporter.export(generator, options);
       }
